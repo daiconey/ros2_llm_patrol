@@ -12,16 +12,43 @@ class LLMRobotCommander(Node):
         super().__init__('llm_robot_commander')
         self.publisher_ = self.create_publisher(Twist, '/model/vehicle_blue/cmd_vel', 10)
 
+    def reset_position(self):
+        """走行開始前にロボットを接地高(z:0.325)で原点へ静止テレポート"""
+        print("[System] ロボットを初期位置 (x:0, y:0) へリセットしています...")
+        stop_twist = Twist()
+        self.publisher_.publish(stop_twist)
+        time.sleep(0.2)
+        
+        # 接地高 z:0.325 で水平配置
+        reset_cmd = (
+            "ign service -s /world/diff_drive/set_pose "
+            "--reqtype ignition.msgs.Pose --reptype ignition.msgs.Boolean --timeout 1000 "
+            "--req 'name: \"vehicle_blue\", position: {x: 0, y: 0, z: 0.325}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}' "
+            "> /dev/null 2>&1"
+        )
+        os.system(reset_cmd)
+        time.sleep(1.0)
+
     def execute_action(self, action, speed, duration):
         twist = Twist()
+        # 直進・後退（浮き上がりを防ぐマイルドな速度）
         if action == "forward":
-            twist.linear.x = float(speed)
+            twist.linear.x = float(speed) if float(speed) <= 0.4 else 0.35
         elif action == "backward":
-            twist.linear.x = -float(speed)
+            twist.linear.x = -float(speed) if float(speed) <= 0.3 else -0.25
+        # その場旋回
         elif action == "turn_left":
-            twist.angular.z = float(speed)
+            twist.angular.z = float(speed) if float(speed) <= 0.8 else 0.6
         elif action == "turn_right":
-            twist.angular.z = -float(speed)
+            twist.angular.z = -float(speed) if float(speed) <= 0.8 else -0.6
+        # カーブ走行（前進速度と旋回角速度の比率を安定化）
+        elif action == "curve_left":
+            twist.linear.x = 0.25
+            twist.angular.z = min(float(speed), 0.4)
+        elif action == "curve_right":
+            twist.linear.x = 0.25
+            twist.angular.z = -min(float(speed), 0.4)
+        # 停止
         elif action == "stop":
             twist.linear.x = 0.0
             twist.angular.z = 0.0
@@ -44,15 +71,23 @@ def call_gemini_api(api_key, user_prompt):
 
     system_prompt = (
         "あなたは差動二輪ロボットの自律移動プランナーAIです。"
-        "ユーザーの指示を解析し、ロボットが実行すべき動作手順をJSON配列のみで出力してください。"
-        "使用可能な action: forward (前進: speed 0.2〜0.8), backward (後退: speed 0.2〜0.5), "
-        "turn_left (左旋回: speed 0.5〜1.5), turn_right (右旋回: speed 0.5〜1.5), stop (停止)。"
-        "【重要】stopの場合も含め、すべての要素に必ず step, action, speed, duration, reason の全キーを含めてください。"
-        "必ずMarkdown装飾(```jsonなど)を含めず、純粋なJSONテキストのみを出力してください。"
-        "例: [{\"step\": 1, \"action\": \"forward\", \"speed\": 0.5, \"duration\": 2.0, \"reason\": \"前進\"}]"
+        "ユーザーの指示を解析し、ロボットが実行すべき動作手順をJSON配列のみで出力してください。\n"
+        "【使用可能な action とパラメータ】\n"
+        "- forward: 前進 (speed 0.2〜0.4)\n"
+        "- backward: 後退 (speed 0.2〜0.3)\n"
+        "- turn_left / turn_right: その場旋回 (speed 0.4〜0.7)\n"
+        "- curve_left: 左カーブ前進 (speed 0.3〜0.4) ※車体が浮かないよう穏やかな旋回\n"
+        "- curve_right: 右カーブ前進 (speed 0.3〜0.4) ※車体が浮かないよう穏やかな旋回\n"
+        "- stop: 停止 (speed 0.0)\n\n"
+        "【重要ルール】\n"
+        "1. ロボットが滑らかに走行できるよう、各ステップの duration（秒数）は 2.5〜5.0 秒程度を確保してください。\n"
+        "2. stopの場合も含め、すべての要素に必ず step, action, speed, duration, reason の全キーを含めてください。\n"
+        "3. 必ずMarkdown装飾(```jsonなど)を含めず、純粋なJSONテキストのみを出力してください。"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    host = "generativelanguage.googleapis.com"
+    url = f"https://{host}/v1beta/models/{model}:generateContent?key={key}"
+
     payload = {
         "contents": [
             {
@@ -100,12 +135,10 @@ def get_action_plan_from_llm(user_prompt):
 
     time.sleep(1.0)
     return [
-        {"step": 1, "action": "forward", "speed": 0.5, "duration": 2.5, "reason": "前方の警戒エリアへ直進"},
-        {"step": 2, "action": "turn_left", "speed": 0.8, "duration": 1.96, "reason": "左方向警戒のため90度旋回"},
-        {"step": 3, "action": "forward", "speed": 0.5, "duration": 2.5, "reason": "左側面ルートをパトロール"},
-        {"step": 4, "action": "turn_left", "speed": 0.8, "duration": 1.96, "reason": "後方警戒のため90度旋回"},
-        {"step": 5, "action": "forward", "speed": 0.5, "duration": 2.5, "reason": "周回パトロールを実行"},
-        {"step": 6, "action": "stop", "speed": 0.0, "duration": 1.0, "reason": "任務完了、初期位置で停止"}
+        {"step": 1, "action": "curve_right", "speed": 0.35, "duration": 3.0, "reason": "スラローム開始: 右へ滑らかにカーブ走行"},
+        {"step": 2, "action": "curve_left", "speed": 0.35, "duration": 3.0, "reason": "スラローム継続: 左へ滑らかにカーブ走行"},
+        {"step": 3, "action": "curve_right", "speed": 0.35, "duration": 3.0, "reason": "スラローム継続: 右へ滑らかにカーブ走行"},
+        {"step": 4, "action": "stop", "speed": 0.0, "duration": 1.0, "reason": "パトロール完了、初期位置で停止"}
     ]
 
 def main():
@@ -115,15 +148,18 @@ def main():
     print("==================================================")
     print("   AI×ROS2 自然言語自律パトロールロボット")
     print("==================================================")
-
+    
     prompt = input("\nロボットへの指示を入力してください (例: 8の字を描くように動いて):\n> ")
     if not prompt.strip():
-        prompt = "周囲を警戒パトロールして初期位置に戻って"
+        prompt = "前方の狭い通路を左右にジグザグに進みながらスラロームパトロールして"
 
     try:
         plan = get_action_plan_from_llm(prompt)
         print("\n【LLMによる行動計画の推論結果】")
         print(json.dumps(plan, ensure_ascii=False, indent=2))
+        
+        commander.reset_position()
+
         print("\nロボットの実行を開始します...")
 
         for item in plan:
