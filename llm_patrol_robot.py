@@ -7,7 +7,6 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
-
 class LLMRobotCommander(Node):
     def __init__(self):
         super().__init__('llm_robot_commander')
@@ -37,7 +36,6 @@ class LLMRobotCommander(Node):
         self.publisher_.publish(twist)
         time.sleep(0.5)
 
-
 def call_gemini_api(api_key, user_prompt):
     key = api_key.strip().strip("'\"")
     model = "gemini-2.5-flash"
@@ -49,11 +47,12 @@ def call_gemini_api(api_key, user_prompt):
         "ユーザーの指示を解析し、ロボットが実行すべき動作手順をJSON配列のみで出力してください。"
         "使用可能な action: forward (前進: speed 0.2〜0.8), backward (後退: speed 0.2〜0.5), "
         "turn_left (左旋回: speed 0.5〜1.5), turn_right (右旋回: speed 0.5〜1.5), stop (停止)。"
+        "【重要】stopの場合も含め、すべての要素に必ず step, action, speed, duration, reason の全キーを含めてください。"
         "必ずMarkdown装飾(```jsonなど)を含めず、純粋なJSONテキストのみを出力してください。"
         "例: [{\"step\": 1, \"action\": \"forward\", \"speed\": 0.5, \"duration\": 2.0, \"reason\": \"前進\"}]"
     )
 
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model}:generateContent?key={key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     payload = {
         "contents": [
             {
@@ -69,15 +68,22 @@ def call_gemini_api(api_key, user_prompt):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
-    with urllib.request.urlopen(req, timeout=60) as res:
-        res_data = json.loads(res.read().decode("utf-8"))
-        raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if "```" in raw_text:
-            lines = raw_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            raw_text = "\n".join(lines).strip()
-        return json.loads(raw_text)
-
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as res:
+                res_data = json.loads(res.read().decode("utf-8"))
+                raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if "```" in raw_text:
+                    lines = raw_text.split("\n")
+                    lines = [l for l in lines if not l.strip().startswith("```")]
+                    raw_text = "\n".join(lines).strip()
+                return json.loads(raw_text)
+        except urllib.error.HTTPError as e:
+            if e.code == 503 and attempt < 3:
+                print(f"[AI] サーバー混雑中(503)。3秒後に再試行します... ({attempt}/3)")
+                time.sleep(3)
+                continue
+            raise e
 
 def get_action_plan_from_llm(user_prompt):
     api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -102,7 +108,6 @@ def get_action_plan_from_llm(user_prompt):
         {"step": 6, "action": "stop", "speed": 0.0, "duration": 1.0, "reason": "任務完了、初期位置で停止"}
     ]
 
-
 def main():
     rclpy.init()
     commander = LLMRobotCommander()
@@ -122,9 +127,14 @@ def main():
         print("\nロボットの実行を開始します...")
 
         for item in plan:
-            print(
-                f"▶ Step {item.get('step', '-')}: {item['action']} (速度: {item['speed']}, 時間: {item['duration']}秒) - 理由: {item.get('reason', '')}")
-            commander.execute_action(item['action'], item['speed'], item['duration'])
+            action = item.get("action", "stop")
+            speed = float(item.get("speed", 0.0))
+            duration = float(item.get("duration", 1.0))
+            reason = item.get("reason", "")
+            step_num = item.get("step", "-")
+
+            print(f"▶ Step {step_num}: {action} (速度: {speed}, 時間: {duration}秒) - 理由: {reason}")
+            commander.execute_action(action, speed, duration)
 
         commander.stop_robot()
         print("\n=== すべてのタスクが正常に完了しました ===")
@@ -134,7 +144,6 @@ def main():
     finally:
         commander.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
